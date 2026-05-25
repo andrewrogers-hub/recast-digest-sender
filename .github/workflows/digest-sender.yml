@@ -24,7 +24,7 @@ jobs:
 
           NOTION_TOKEN = os.environ["NOTION_API_KEY"]
           SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-          DATABASE_ID = "3359b081-f7e5-80cd-b270-000bef9238a7"
+          DATABASE_ID = "3359b081-f7e5-807d-9a17-c693397a0a09"
           DIGEST_PARENT_PAGE_ID = "3359b081f7e58072870ef77060ca9969"
 
           NOTION_HEADERS = {
