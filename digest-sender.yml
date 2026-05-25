@@ -1,0 +1,246 @@
+name: Weekly Digest Sender
+
+on:
+  schedule:
+    # 11:00am ET on Mondays. Two crons to handle EDT (UTC-4) and EST (UTC-5).
+    # On weeks where both fire, the second is a no-op because rows are already "Sent."
+    - cron: '0 15 * * 1'  # 11am ET during EDT (Mar–Nov)
+    - cron: '0 16 * * 1'  # 11am ET during EST (Nov–Mar)
+  workflow_dispatch:
+
+jobs:
+  send-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send digest DMs
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, urllib.request
+          from datetime import datetime, timezone
+          from collections import defaultdict
+
+          NOTION_TOKEN = os.environ["NOTION_API_KEY"]
+          SLACK_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+          DATABASE_ID = "3359b081-f7e5-80cd-b270-000bef9238a7"
+          DIGEST_PARENT_PAGE_ID = "3359b081f7e58072870ef77060ca9969"
+
+          NOTION_HEADERS = {
+              "Authorization": f"Bearer {NOTION_TOKEN}",
+              "Notion-Version": "2022-06-28",
+              "Content-Type": "application/json",
+          }
+
+          RISK_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+
+          # ---------- HTTP helpers ----------
+
+          def notion_post(endpoint, body):
+              req = urllib.request.Request(
+                  f"https://api.notion.com/v1/{endpoint}",
+                  data=json.dumps(body).encode(),
+                  headers=NOTION_HEADERS,
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def notion_patch(endpoint, body):
+              req = urllib.request.Request(
+                  f"https://api.notion.com/v1/{endpoint}",
+                  data=json.dumps(body).encode(),
+                  headers=NOTION_HEADERS,
+                  method="PATCH",
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def notion_get(endpoint):
+              req = urllib.request.Request(
+                  f"https://api.notion.com/v1/{endpoint}",
+                  headers=NOTION_HEADERS,
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          def slack_post_dm(target_id, text):
+              # SAFETY GUARD: this bot only DMs individual users.
+              # Slack user IDs always start with "U". Anything else is refused.
+              if not isinstance(target_id, str) or not target_id.startswith("U"):
+                  print(f"  BLOCKED: target_id '{target_id}' is not a user ID. Refusing to send.")
+                  return {"ok": False, "error": "blocked_non_user_target"}
+
+              req = urllib.request.Request(
+                  "https://slack.com/api/chat.postMessage",
+                  data=json.dumps({"channel": target_id, "text": text}).encode(),
+                  headers={
+                      "Authorization": f"Bearer {SLACK_TOKEN}",
+                      "Content-Type": "application/json; charset=utf-8",
+                  },
+              )
+              with urllib.request.urlopen(req) as r:
+                  return json.loads(r.read())
+
+          # ---------- Notion property parsing ----------
+
+          def get_property_value(props, name):
+              prop = props.get(name)
+              if not prop:
+                  return None
+              t = prop.get("type")
+              if t == "title":
+                  return "".join(x["plain_text"] for x in prop["title"]).strip()
+              if t == "rich_text":
+                  return "".join(x["plain_text"] for x in prop["rich_text"]).strip()
+              if t == "select":
+                  return prop["select"]["name"] if prop["select"] else None
+              if t == "number":
+                  return prop["number"]
+              if t == "date":
+                  return prop["date"]["start"] if prop["date"] else None
+              return None
+
+          # ---------- Main ----------
+
+          print(f"Run started: {datetime.now(timezone.utc).isoformat()}")
+          print(f"Querying Notion DB {DATABASE_ID} for 'Ready to Send' rows...")
+
+          query_result = notion_post(
+              f"databases/{DATABASE_ID}/query",
+              {
+                  "filter": {
+                      "property": "Delivery Status",
+                      "select": {"equals": "Ready to Send"},
+                  }
+              },
+          )
+
+          rows = query_result.get("results", [])
+          print(f"Found {len(rows)} rows ready to send.\n")
+
+          if not rows:
+              print("Nothing to send. Exiting cleanly.")
+              exit(0)
+
+          # Group clients by assignee
+          assignee_groups = defaultdict(list)
+
+          for row in rows:
+              props = row["properties"]
+              client_name = get_property_value(props, "Name") or "(unnamed client)"
+              risk_level = get_property_value(props, "Current Risk Level")
+              risk_score = get_property_value(props, "Current Risk Score")
+              assignee_raw = get_property_value(props, "Assignee")
+
+              if not assignee_raw:
+                  print(f"  Skipping {client_name}: no Assignee.")
+                  continue
+
+              # Find the most recent child page under this row (this week's digest)
+              try:
+                  children = notion_get(f"blocks/{row['id']}/children?page_size=100").get("results", [])
+              except Exception as e:
+                  print(f"  Skipping {client_name}: could not fetch children: {e}")
+                  continue
+
+              child_pages = [c for c in children if c.get("type") == "child_page"]
+              if not child_pages:
+                  print(f"  Skipping {client_name}: no child digest page found.")
+                  continue
+
+              latest_child = child_pages[-1]
+              child_page_id = latest_child["id"]
+              child_page_url = f"https://www.notion.so/{child_page_id.replace('-', '')}"
+
+              # Parse comma-separated assignees and add this client to each one's bucket
+              assignees = [a.strip() for a in assignee_raw.split(",") if a.strip()]
+              for assignee in assignees:
+                  assignee_groups[assignee].append({
+                      "row_id": row["id"],
+                      "client_name": client_name,
+                      "risk_level": risk_level or "Unknown",
+                      "risk_score": risk_score if risk_score is not None else 0,
+                      "child_page_url": child_page_url,
+                  })
+
+          if not assignee_groups:
+              print("\nNo clients have a valid Assignee. Nothing to send.")
+              exit(0)
+
+          # Find the most recent portfolio summary page under the parent digest page
+          summary_url = None
+          try:
+              parent_children = notion_get(f"blocks/{DIGEST_PARENT_PAGE_ID}/children?page_size=100").get("results", [])
+              summary_pages = [
+                  c for c in parent_children
+                  if c.get("type") == "child_page"
+                  and "Portfolio Summary" in c.get("child_page", {}).get("title", "")
+              ]
+              if summary_pages:
+                  latest_summary = summary_pages[-1]
+                  summary_url = f"https://www.notion.so/{latest_summary['id'].replace('-', '')}"
+                  print(f"\nPortfolio summary URL: {summary_url}")
+              else:
+                  print("\nNo Portfolio Summary page found under parent. DMs will omit summary link.")
+          except Exception as e:
+              print(f"\nCould not fetch portfolio summary: {e}")
+
+          # Send one DM per assignee
+          today = datetime.now(timezone.utc).strftime("%b %d, %Y")
+          sent_row_ids = []
+          failed_assignees = []
+
+          print(f"\nSending DMs to {len(assignee_groups)} assignees...\n")
+
+          for assignee_id, clients in assignee_groups.items():
+              # Sort: Critical first, then High, Medium, Low
+              clients_sorted = sorted(clients, key=lambda c: RISK_ORDER.get(c["risk_level"], 99))
+
+              lines = [
+                  f"*Weekly Client News Digest — Week of {today}*",
+                  "",
+                  "Your clients this week:",
+              ]
+              for c in clients_sorted:
+                  lines.append(
+                      f"• *{c['client_name']}* — {c['risk_level']} ({c['risk_score']}) — {c['child_page_url']}"
+                  )
+
+              if summary_url:
+                  lines.append("")
+                  lines.append(f"Portfolio summary: {summary_url}")
+
+              message = "\n".join(lines)
+
+              print(f"  -> {assignee_id} ({len(clients)} clients)")
+              result = slack_post_dm(assignee_id, message)
+
+              if result.get("ok"):
+                  for c in clients:
+                      sent_row_ids.append(c["row_id"])
+                  print(f"     OK")
+              else:
+                  print(f"     FAILED: {result.get('error')}")
+                  failed_assignees.append(assignee_id)
+
+          # Flip successfully-sent rows to "Sent"
+          today_iso = datetime.now(timezone.utc).date().isoformat()
+          unique_row_ids = list(set(sent_row_ids))
+
+          print(f"\nMarking {len(unique_row_ids)} rows as Sent...")
+          for row_id in unique_row_ids:
+              try:
+                  notion_patch(f"pages/{row_id}", {
+                      "properties": {
+                          "Delivery Status": {"select": {"name": "Sent"}},
+                          "Delivery Sent At": {"date": {"start": today_iso}},
+                      }
+                  })
+              except Exception as e:
+                  print(f"  Failed to update {row_id}: {e}")
+
+          print(f"\nDone. Sent {len(unique_row_ids)} client digests to {len(assignee_groups) - len(failed_assignees)} assignees.")
+          if failed_assignees:
+              print(f"Failed assignees (DM was not sent, rows remain 'Ready to Send'): {failed_assignees}")
+          PYEOF
