@@ -1,11 +1,11 @@
 name: Weekly Digest Sender
 
 on:
-  schedule:
-    # 11:00am ET on Mondays. Two crons to handle EDT (UTC-4) and EST (UTC-5).
-    # On weeks where both fire, the second is a no-op because rows are already "Sent."
-    - cron: '0 15 * * 1'  # 11am ET during EDT (Mar–Nov)
-    - cron: '0 16 * * 1'  # 11am ET during EST (Nov–Mar)
+schedule:
+  # 15:00 UTC every Monday. Lands at 11am ET during EDT (Mar–Nov)
+  # and 10am ET during EST (Nov–Mar). Note: GitHub Actions cron may
+  # delay by up to an hour during peak load.
+  - cron: '0 15 * * 1'
   workflow_dispatch:
 
 jobs:
