@@ -1,6 +1,6 @@
 name: Weekly Digest Sender
 
-on:
+off:
 schedule:
   # 15:00 UTC every Monday. Lands at 11am ET during EDT (Mar–Nov)
   # and 10am ET during EST (Nov–Mar). Note: GitHub Actions cron may
